@@ -3,7 +3,8 @@
 # -Scope CurrentUser use this to install more local the powershell module
 # Run this script with current priviligies
 # Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass 
-
+#Install-Module -Name MicrosoftPowerBIMgmt -Scope CurrentUser
+ 
 #1. login to Power BI using a tenant id
 Connect-PowerBIServiceAccount
 
