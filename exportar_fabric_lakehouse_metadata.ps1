@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-Exporta la definición pública, inventario de tablas y metadatos SQL opcionales
+Exporta la definición pública, inventario, columnas y DDL Spark/Delta
 de un Lakehouse de Microsoft Fabric.
 
 .EXAMPLE
@@ -30,8 +30,15 @@ El script siempre exporta:
 - Inventario paginado de tablas administradas y externas.
 - Una consulta INFORMATION_SCHEMA lista para ejecutar.
 
-Si se proporcionan SqlEndpoint y SqlDatabase, el script intenta ejecutar la
-consulta INFORMATION_SCHEMA mediante Invoke-Sqlcmd y exporta columns.csv.
+El script autodetecta SqlEndpoint y SqlDatabase desde el Lakehouse. También
+pueden proporcionarse explícitamente para sobrescribir los valores detectados.
+Si Invoke-Sqlcmd está disponible, consulta INFORMATION_SCHEMA y genera:
+- columns.csv y columns.json.
+- ddl\spark\<schema>.<table>.sql.
+- ddl\spark\all-tables.sql.
+
+El DDL reconstruye tablas Delta vacías. La API no exporta filas ni sentencias
+INSERT/MERGE; para copiar datos se requiere OneLake, Spark o un pipeline.
 #>
 [CmdletBinding()]
 param(
@@ -141,11 +148,6 @@ if (-not (Get-Command az -ErrorAction SilentlyContinue)) {
     throw "Azure CLI no está instalado o no se encuentra en PATH."
 }
 
-if ([string]::IsNullOrWhiteSpace($SqlEndpoint) -xor
-    [string]::IsNullOrWhiteSpace($SqlDatabase)) {
-    throw "SqlEndpoint y SqlDatabase deben proporcionarse juntos."
-}
-
 Write-Step "Validando autenticación de Azure CLI"
 $account = az account show --output json 2>$null | ConvertFrom-Json
 if (-not $account) {
@@ -205,6 +207,14 @@ $lakehouse = Invoke-RestMethod `
 Write-JsonFile `
     -Value $lakehouse `
     -Path (Join-Path $resolvedOutput "lakehouse-item.json")
+
+if ([string]::IsNullOrWhiteSpace($SqlEndpoint)) {
+    $SqlEndpoint = $lakehouse.properties.sqlEndpointProperties.connectionString
+}
+
+if ([string]::IsNullOrWhiteSpace($SqlDatabase)) {
+    $SqlDatabase = $lakehouse.displayName
+}
 
 Write-Step "Solicitando definición pública del Lakehouse"
 $definitionUrl = (
@@ -345,6 +355,133 @@ $utf8WithoutBom = [Text.UTF8Encoding]::new($false)
     $utf8WithoutBom
 )
 
+function ConvertTo-SparkIdentifier {
+    param([Parameter(Mandatory)][string]$Name)
+
+    return '`' + $Name.Replace('`', '``') + '`'
+}
+
+function ConvertTo-SparkDataType {
+    param([Parameter(Mandatory)]$Column)
+
+    $dataType = ([string]$Column.DATA_TYPE).ToLowerInvariant()
+    switch ($dataType) {
+        "bigint" { return "BIGINT" }
+        "binary" { return "BINARY" }
+        "bit" { return "BOOLEAN" }
+        "char" { return "STRING" }
+        "date" { return "DATE" }
+        "datetime" { return "TIMESTAMP" }
+        "datetime2" { return "TIMESTAMP" }
+        "datetimeoffset" { return "TIMESTAMP" }
+        "decimal" {
+            return "DECIMAL($($Column.NUMERIC_PRECISION),$($Column.NUMERIC_SCALE))"
+        }
+        "float" { return "DOUBLE" }
+        "image" { return "BINARY" }
+        "int" { return "INT" }
+        "money" { return "DECIMAL(19,4)" }
+        "nchar" { return "STRING" }
+        "ntext" { return "STRING" }
+        "numeric" {
+            return "DECIMAL($($Column.NUMERIC_PRECISION),$($Column.NUMERIC_SCALE))"
+        }
+        "nvarchar" { return "STRING" }
+        "real" { return "FLOAT" }
+        "smalldatetime" { return "TIMESTAMP" }
+        "smallint" { return "SMALLINT" }
+        "smallmoney" { return "DECIMAL(10,4)" }
+        "text" { return "STRING" }
+        "time" { return "STRING" }
+        "timestamp" { return "BINARY" }
+        "tinyint" { return "TINYINT" }
+        "uniqueidentifier" { return "STRING" }
+        "varbinary" { return "BINARY" }
+        "varchar" { return "STRING" }
+        "xml" { return "STRING" }
+        default {
+            throw (
+                "Tipo SQL no soportado para DDL Spark: '$dataType' " +
+                "en $($Column.TABLE_SCHEMA).$($Column.TABLE_NAME)." +
+                "$($Column.COLUMN_NAME)"
+            )
+        }
+    }
+}
+
+function Export-SparkDdl {
+    param(
+        [Parameter(Mandatory)][array]$Columns,
+        [Parameter(Mandatory)][string]$OutputDirectory
+    )
+
+    $ddlDirectory = Join-Path $OutputDirectory "ddl\spark"
+    New-Item -ItemType Directory -Path $ddlDirectory -Force | Out-Null
+    $allStatements = [Collections.Generic.List[string]]::new()
+    $tableGroups = @(
+        $Columns |
+            Group-Object {
+                "$($_.TABLE_SCHEMA)`u{001F}$($_.TABLE_NAME)"
+            } |
+            Sort-Object Name
+    )
+
+    foreach ($tableGroup in $tableGroups) {
+        $orderedColumns = @(
+            $tableGroup.Group | Sort-Object {[int]$_.ORDINAL_POSITION}
+        )
+        $firstColumn = $orderedColumns[0]
+        $schemaName = [string]$firstColumn.TABLE_SCHEMA
+        $tableName = [string]$firstColumn.TABLE_NAME
+        $columnLines = foreach ($column in $orderedColumns) {
+            $columnName = ConvertTo-SparkIdentifier `
+                -Name ([string]$column.COLUMN_NAME)
+            $sparkType = ConvertTo-SparkDataType -Column $column
+            $nullableSuffix = if ($column.IS_NULLABLE -eq "NO") {
+                " NOT NULL"
+            }
+            else {
+                ""
+            }
+
+            "    $columnName $sparkType$nullableSuffix"
+        }
+
+        $qualifiedName = if ($schemaName -eq "dbo") {
+            ConvertTo-SparkIdentifier -Name $tableName
+        }
+        else {
+            (
+                (ConvertTo-SparkIdentifier -Name $schemaName) + "." +
+                (ConvertTo-SparkIdentifier -Name $tableName)
+            )
+        }
+        $statement = (
+            "CREATE TABLE IF NOT EXISTS $qualifiedName (`n" +
+            ($columnLines -join ",`n") +
+            "`n) USING DELTA;`n"
+        )
+        $safeFileName = (
+            ($schemaName + "." + $tableName) -replace '[<>:"/\\|?*]', '_'
+        ) + ".sql"
+        [IO.File]::WriteAllText(
+            (Join-Path $ddlDirectory $safeFileName),
+            $statement,
+            $utf8WithoutBom
+        )
+        $null = $allStatements.Add($statement)
+    }
+
+    [IO.File]::WriteAllText(
+        (Join-Path $ddlDirectory "all-tables.sql"),
+        ($allStatements -join "`n"),
+        $utf8WithoutBom
+    )
+
+    return $tableGroups.Count
+}
+
+$ddlTableCount = 0
 if ($SqlEndpoint -and $SqlDatabase) {
     Write-Step "Consultando INFORMATION_SCHEMA en el SQL endpoint"
 
@@ -377,7 +514,22 @@ if ($SqlEndpoint -and $SqlDatabase) {
                 -Path (Join-Path $resolvedOutput "columns.csv") `
                 -NoTypeInformation `
                 -Encoding UTF8
+
+        Write-JsonFile `
+            -Value @($columns) `
+            -Path (Join-Path $resolvedOutput "columns.json")
+
+        Write-Step "Generando DDL Spark/Delta por tabla"
+        $ddlTableCount = Export-SparkDdl `
+            -Columns @($columns) `
+            -OutputDirectory $resolvedOutput
     }
+}
+else {
+    Write-Warning (
+        "El Lakehouse no expone un SQL analytics endpoint. " +
+        "Se exportó information-schema.sql para ejecución manual."
+    )
 }
 
 $summary = [ordered]@{
@@ -390,6 +542,9 @@ $summary = [ordered]@{
     managedTables = @($tables | Where-Object type -eq "Managed").Count
     externalTables = @($tables | Where-Object type -eq "External").Count
     columnsExported = Test-Path (Join-Path $resolvedOutput "columns.csv")
+    ddlTablesExported = $ddlTableCount
+    ddlFormat = if ($ddlTableCount -gt 0) { "SparkSqlDelta" } else { $null }
+    dataExported = $false
 }
 
 Write-JsonFile `
@@ -411,6 +566,7 @@ Write-Host "`nExportación completada." -ForegroundColor Green
 Write-Host "Directorio: $resolvedOutput"
 Write-Host "ZIP:        $resolvedZip"
 Write-Host "Tablas:     $($tables.Count)"
+Write-Host "DDL:        $ddlTableCount tablas"
 
 if (-not (Test-Path (Join-Path $resolvedOutput "columns.csv"))) {
     Write-Host (
