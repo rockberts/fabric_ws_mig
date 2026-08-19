@@ -409,6 +409,55 @@ function ConvertTo-SparkDataType {
     }
 }
 
+function ConvertTo-ColumnMetadata {
+    param([Parameter(Mandatory)]$Column)
+
+    [pscustomobject][ordered]@{
+        TABLE_SCHEMA = [string]$Column.TABLE_SCHEMA
+        TABLE_NAME = [string]$Column.TABLE_NAME
+        COLUMN_NAME = [string]$Column.COLUMN_NAME
+        ORDINAL_POSITION = [int]$Column.ORDINAL_POSITION
+        DATA_TYPE = [string]$Column.DATA_TYPE
+        CHARACTER_MAXIMUM_LENGTH = if (
+            $null -eq $Column.CHARACTER_MAXIMUM_LENGTH -or
+            $Column.CHARACTER_MAXIMUM_LENGTH -is [DBNull]
+        ) {
+            $null
+        }
+        else {
+            [long]$Column.CHARACTER_MAXIMUM_LENGTH
+        }
+        NUMERIC_PRECISION = if (
+            $null -eq $Column.NUMERIC_PRECISION -or
+            $Column.NUMERIC_PRECISION -is [DBNull]
+        ) {
+            $null
+        }
+        else {
+            [int]$Column.NUMERIC_PRECISION
+        }
+        NUMERIC_SCALE = if (
+            $null -eq $Column.NUMERIC_SCALE -or
+            $Column.NUMERIC_SCALE -is [DBNull]
+        ) {
+            $null
+        }
+        else {
+            [int]$Column.NUMERIC_SCALE
+        }
+        DATETIME_PRECISION = if (
+            $null -eq $Column.DATETIME_PRECISION -or
+            $Column.DATETIME_PRECISION -is [DBNull]
+        ) {
+            $null
+        }
+        else {
+            [int]$Column.DATETIME_PRECISION
+        }
+        IS_NULLABLE = [string]$Column.IS_NULLABLE
+    }
+}
+
 function Export-SparkDdl {
     param(
         [Parameter(Mandatory)][array]$Columns,
@@ -501,13 +550,23 @@ if ($SqlEndpoint -and $SqlDatabase) {
             throw "No fue posible obtener un token para el SQL endpoint."
         }
 
-        $columns = Invoke-Sqlcmd `
+        $sqlColumns = @(
+            Invoke-Sqlcmd `
             -ServerInstance $SqlEndpoint `
             -Database $SqlDatabase `
             -AccessToken $sqlToken `
             -Query $informationSchemaQuery `
             -TrustServerCertificate:$false `
             -ErrorAction Stop
+        )
+
+        Write-Host "Filas de columnas recibidas: $($sqlColumns.Count)"
+        Write-Step "Normalizando metadata de columnas"
+        $columns = @(
+            $sqlColumns | ForEach-Object {
+                ConvertTo-ColumnMetadata -Column $_
+            }
+        )
 
         $columns |
             Export-Csv `
@@ -516,8 +575,9 @@ if ($SqlEndpoint -and $SqlDatabase) {
                 -Encoding UTF8
 
         Write-JsonFile `
-            -Value @($columns) `
-            -Path (Join-Path $resolvedOutput "columns.json")
+            -Value $columns `
+            -Path (Join-Path $resolvedOutput "columns.json") `
+            -Depth 5
 
         Write-Step "Generando DDL Spark/Delta por tabla"
         $ddlTableCount = Export-SparkDdl `
